@@ -1,0 +1,48 @@
+{
+  "name": "@jturle/openclaw-procwatch",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin: trigger agent invocations from process output patterns",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "process",
+    "watcher",
+    "dev-server",
+    "automation"
+  ],
+  "author": "James Turle",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jturle/openclaw-procwatch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jturle/openclaw-procwatch/issues"
+  },
+  "homepage": "https://github.com/jturle/openclaw-procwatch#readme",
+  "devDependencies": {
+    "@sinclair/typebox": "^0.32.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=1.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "procwatch",
+  "name": "Process Watcher",
+  "description": "Watch process output and trigger agent invocations on pattern matches",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "webhookUrl": {
+        "type": "string",
+        "description": "Gateway webhook URL (defaults to http://127.0.0.1:18789)"
+      },
+      "webhookToken": {
+        "type": "string",
+        "description": "Webhook auth token (or use OPENCLAW_HOOKS_TOKEN env var)"
+      },
+      "defaultPatterns": {
+        "type": "array",
+        "description": "Default patterns to watch for",
+        "items": {
+          "type": "object",
+          "properties": {
+            "regex": { "type": "string" },
+            "label": { "type": "string" },
+            "contextLines": { "type": "number" }
+          },
+          "required": ["regex", "label"]
+        }
+      }
+    }
+  }
+}
