@@ -14,6 +14,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "deploy:test": "npm run build && cp -r dist ~/.openclaw/extensions/openclaw-procwatch/ && openclaw gateway restart",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
