@@ -26,6 +26,9 @@
   ],
   "author": "James Turle",
   "license": "MIT",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jturle/openclaw-procwatch.git"

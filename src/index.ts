@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from "node:child_process";
 import { Type, type Static } from "@sinclair/typebox";
+import type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk";
 
 // Types
 interface WatchPattern {
@@ -10,86 +11,150 @@ interface WatchPattern {
 
 interface WatchedProcess {
   id: string;
+  sessionKey: string;
   command: string;
-  args: string[];
   patterns: WatchPattern[];
   process: ChildProcess;
   buffer: string[];
   maxBufferLines: number;
   startedAt: Date;
+  lastNotifyAt: number; // timestamp for throttling
+  pendingNotify: { message: string; name: string } | null;
+  throttleTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface PluginConfig {
-  webhookUrl?: string;
-  webhookToken?: string;
   defaultPatterns?: WatchPattern[];
+  throttleMs?: number; // default 5000
 }
 
 // State
 const processes = new Map<string, WatchedProcess>();
 let pluginConfig: PluginConfig = {};
-let invokeAgent: ((message: string, name?: string) => Promise<void>) | null = null;
+let enqueueSystemEvent: PluginRuntime["system"]["enqueueSystemEvent"];
+let gatewayPort = 18789;
+let hooksToken: string | undefined;
+let logger: OpenClawPluginApi["logger"] = {
+  info: (msg) => console.log(`[procwatch] ${msg}`),
+  warn: (msg) => console.warn(`[procwatch] ${msg}`),
+  error: (msg) => console.error(`[procwatch] ${msg}`),
+};
 
-// Webhook invocation
-async function triggerAgent(message: string, name: string = "ProcWatch"): Promise<void> {
-  if (invokeAgent) {
-    await invokeAgent(message, name);
+const THROTTLE_MS = 5000; // 5 second throttle
+
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }], details: null };
+}
+
+// Notify session via system event + wake
+function notifySession(message: string, name: string, sessionKey: string): void {
+  logger.info(`System event for session '${sessionKey}': ${name} - ${message.slice(0, 80)}...`);
+
+  // Enqueue the event content for the agent to see on next turn
+  enqueueSystemEvent(`[ProcWatch:${name}] ${message}`, { sessionKey });
+
+  // TODO: re-enable once hook auth is sorted
+  // wakeAgent(name, sessionKey);
+}
+
+async function wakeAgent(name: string, sessionKey: string): Promise<void> {
+  if (!hooksToken) {
+    logger.warn("No hooks token configured - agent will see event on next heartbeat");
     return;
   }
 
-  // Fallback to direct webhook call
-  const url = pluginConfig.webhookUrl || "http://127.0.0.1:18789";
-  const token = pluginConfig.webhookToken || process.env.OPENCLAW_HOOKS_TOKEN;
+  const url = `http://127.0.0.1:${gatewayPort}/hooks/agent`;
+  const payload = {
+    message: name,
+    name,
+    sessionKey,
+    channel: "last",
+    wakeMode: "now",
+    deliver: true,
+  };
 
-  if (!token) {
-    console.error("[procwatch] No webhook token configured");
-    return;
-  }
+  const tokenPreview = hooksToken!.slice(0, 6) + "...";
+  logger.info(`Hook request to ${url} (token: ${tokenPreview}): ${JSON.stringify(payload)}`);
 
   try {
-    const res = await fetch(`${url}/hooks/agent`, {
+    const res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${hooksToken}`,
       },
-      body: JSON.stringify({
-        message,
-        name,
-        wakeMode: "now",
-      }),
+      body: JSON.stringify(payload),
     });
 
-    if (!res.ok) {
-      console.error(`[procwatch] Webhook failed: ${res.status} ${res.statusText}`);
+    const body = await res.text();
+    if (res.ok) {
+      logger.info(`Hook success for session '${sessionKey}': ${body}`);
+    } else {
+      logger.error(`Hook failed: ${res.status} ${res.statusText} - ${body}`);
     }
   } catch (err) {
-    console.error("[procwatch] Webhook error:", err);
+    logger.error(`Hook error: ${err}`);
+  }
+}
+
+// Throttled notification
+function triggerAgent(watched: WatchedProcess, message: string, name: string): void {
+  const now = Date.now();
+  const throttleMs = pluginConfig.throttleMs ?? THROTTLE_MS;
+  const timeSinceLastNotify = now - watched.lastNotifyAt;
+
+  if (timeSinceLastNotify >= throttleMs) {
+    // Can send immediately
+    watched.lastNotifyAt = now;
+    watched.pendingNotify = null;
+    if (watched.throttleTimer) {
+      clearTimeout(watched.throttleTimer);
+      watched.throttleTimer = null;
+    }
+    notifySession(message, name, watched.sessionKey);
+  } else {
+    // Throttle: update pending (latest wins)
+    logger.info(`Throttling notification for '${watched.id}' (session: ${watched.sessionKey}) - will send in ${throttleMs - timeSinceLastNotify}ms`);
+    watched.pendingNotify = { message, name };
+
+    if (!watched.throttleTimer) {
+      watched.throttleTimer = setTimeout(() => {
+        if (watched.pendingNotify) {
+          watched.lastNotifyAt = Date.now();
+          notifySession(watched.pendingNotify.message, watched.pendingNotify.name, watched.sessionKey);
+          watched.pendingNotify = null;
+        }
+        watched.throttleTimer = null;
+      }, throttleMs - timeSinceLastNotify);
+    }
   }
 }
 
 // Process management
 function startWatch(
   id: string,
+  sessionKey: string,
   command: string,
-  args: string[],
   patterns: WatchPattern[],
   maxBufferLines: number = 100
 ): WatchedProcess {
-  const proc = spawn(command, args, {
+  const proc = spawn(command, [], {
     shell: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
   const watched: WatchedProcess = {
     id,
+    sessionKey,
     command,
-    args,
     patterns,
     process: proc,
     buffer: [],
     maxBufferLines,
     startedAt: new Date(),
+    lastNotifyAt: 0,
+    pendingNotify: null,
+    throttleTimer: null,
   };
 
   const handleOutput = (data: Buffer, stream: "stdout" | "stderr") => {
@@ -108,11 +173,13 @@ function startWatch(
       for (const pattern of patterns) {
         const re = new RegExp(pattern.regex, "i");
         if (re.test(line)) {
+          logger.info(`Pattern match in '${id}' (session: ${sessionKey}): "${pattern.label}" matched: ${line.slice(0, 80)}`);
           const contextLines = pattern.contextLines ?? 10;
           const context = watched.buffer.slice(-contextLines).join("\n");
 
           triggerAgent(
-            `**${pattern.label}** detected in process \`${id}\`:\n\n\`\`\`\n${context}\n\`\`\`\n\nProcess: \`${command} ${args.join(" ")}\``,
+            watched,
+            `**${pattern.label}** detected in process \`${id}\`:\n\n\`\`\`\n${context}\n\`\`\`\n\nProcess: \`${command}\``,
             `ProcWatch:${pattern.label}`
           );
         }
@@ -125,7 +192,15 @@ function startWatch(
 
   proc.on("exit", (code, signal) => {
     const reason = signal ? `signal ${signal}` : `code ${code}`;
+    logger.info(`Process '${id}' exited (${reason}) - session: ${sessionKey}`);
+    
+    // Clear any pending throttle timer
+    if (watched.throttleTimer) {
+      clearTimeout(watched.throttleTimer);
+    }
+
     triggerAgent(
+      watched,
       `Process \`${id}\` exited with ${reason}.\n\nLast output:\n\`\`\`\n${watched.buffer.slice(-15).join("\n")}\n\`\`\``,
       "ProcWatch:Exit"
     );
@@ -133,13 +208,16 @@ function startWatch(
   });
 
   proc.on("error", (err) => {
+    logger.error(`Process '${id}' failed to start: ${err.message} - session: ${sessionKey}`);
     triggerAgent(
+      watched,
       `Process \`${id}\` failed to start: ${err.message}`,
       "ProcWatch:Error"
     );
     processes.delete(id);
   });
 
+  logger.info(`Process '${id}' started (PID ${proc.pid}) - session: ${sessionKey} - command: ${command}`);
   processes.set(id, watched);
   return watched;
 }
@@ -147,6 +225,13 @@ function startWatch(
 function stopWatch(id: string): boolean {
   const watched = processes.get(id);
   if (!watched) return false;
+
+  logger.info(`Stopping process '${id}' (PID ${watched.process.pid}) - session: ${watched.sessionKey}`);
+  
+  // Clear any pending throttle timer
+  if (watched.throttleTimer) {
+    clearTimeout(watched.throttleTimer);
+  }
 
   watched.process.kill("SIGTERM");
   processes.delete(id);
@@ -157,6 +242,7 @@ function stopWatch(id: string): boolean {
 const ProcessWatchParams = Type.Object({
   id: Type.String({ description: "Unique identifier for this watch" }),
   command: Type.String({ description: "Command to run (e.g., 'npm run dev')" }),
+  sessionKey: Type.String({ description: "Session key to notify when patterns match" }),
   patterns: Type.Optional(
     Type.Array(
       Type.Object({
@@ -188,28 +274,42 @@ const DEFAULT_PATTERNS: WatchPattern[] = [
 ];
 
 // Plugin entry
-export default function (api: any) {
-  // Get config
-  pluginConfig = api.getConfig?.() || {};
-
-  // Register agent invocation helper if available
-  if (api.invokeAgent) {
-    invokeAgent = api.invokeAgent;
+export default function (api: OpenClawPluginApi) {
+  // Use OpenClaw logger if available
+  if (api.logger) {
+    logger = {
+      info: (msg: string) => api.logger.info(`[procwatch] ${msg}`),
+      warn: (msg: string) => api.logger.warn(`[procwatch] ${msg}`),
+      error: (msg: string) => api.logger.error(`[procwatch] ${msg}`),
+    };
   }
+
+  // Get plugin-specific config from api.pluginConfig
+  pluginConfig = (api.pluginConfig as PluginConfig) || {};
+
+  // Grab system event dispatcher from runtime
+  enqueueSystemEvent = api.runtime.system.enqueueSystemEvent;
+
+  // Resolve hooks token for wake calls (local loopback to gateway)
+  const hooksConfig = (api.config as Record<string, any>)?.hooks;
+  hooksToken = hooksConfig?.token || process.env.OPENCLAW_HOOKS_TOKEN;
+  if (hooksConfig?.port) gatewayPort = hooksConfig.port;
+
+  const throttleMs = pluginConfig.throttleMs ?? THROTTLE_MS;
+  logger.info(`Plugin initialized (throttle: ${throttleMs}ms, wake: ${hooksToken ? "enabled" : "disabled"})`);
 
   // Register tools
   api.registerTool({
     name: "process_watch",
+    label: "Process Watch",
     description:
       "Start a process and watch its output. Triggers agent invocation when patterns match (errors, warnings, etc). Useful for dev servers, build watchers, test runners.",
     parameters: ProcessWatchParams,
     async execute(_id: string, params: Static<typeof ProcessWatchParams>) {
-      const { id, command, patterns, cwd } = params;
+      const { id, command, sessionKey, patterns, cwd } = params;
 
       if (processes.has(id)) {
-        return {
-          content: [{ type: "text", text: `Watch '${id}' already exists. Stop it first with process_unwatch.` }],
-        };
+        return textResult(`Watch '${id}' already exists. Stop it first with process_unwatch.`);
       }
 
       const effectivePatterns = patterns?.length
@@ -218,34 +318,22 @@ export default function (api: any) {
           ? pluginConfig.defaultPatterns
           : DEFAULT_PATTERNS;
 
-      // Parse command into parts
-      const parts = command.split(" ");
-      const cmd = parts[0];
-      const args = parts.slice(1);
-
       // Change to cwd if specified
       const originalCwd = process.cwd();
       if (cwd) {
         try {
           process.chdir(cwd);
         } catch (err) {
-          return {
-            content: [{ type: "text", text: `Failed to change to directory: ${cwd}` }],
-          };
+          return textResult(`Failed to change to directory: ${cwd}`);
         }
       }
 
       try {
-        const watched = startWatch(id, cmd, args, effectivePatterns);
+        const watched = startWatch(id, sessionKey, command, effectivePatterns);
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Started watching process '${id}':\n- Command: ${command}\n- Patterns: ${effectivePatterns.map((p) => p.label).join(", ")}\n- PID: ${watched.process.pid}\n\nI'll be invoked automatically when patterns match.`,
-            },
-          ],
-        };
+        return textResult(
+          `Started watching process '${id}':\n- Command: ${command}\n- Session: ${sessionKey}\n- Patterns: ${effectivePatterns.map((p) => p.label).join(", ")}\n- PID: ${watched.process.pid}\n- Throttle: ${pluginConfig.throttleMs ?? THROTTLE_MS}ms\n\nI'll be invoked automatically when patterns match.`
+        );
       } finally {
         if (cwd) process.chdir(originalCwd);
       }
@@ -254,51 +342,48 @@ export default function (api: any) {
 
   api.registerTool({
     name: "process_unwatch",
+    label: "Process Unwatch",
     description: "Stop watching a process",
     parameters: ProcessUnwatchParams,
     async execute(_id: string, params: Static<typeof ProcessUnwatchParams>) {
       const { id } = params;
 
       if (stopWatch(id)) {
-        return {
-          content: [{ type: "text", text: `Stopped watching process '${id}'` }],
-        };
+        return textResult(`Stopped watching process '${id}'`);
       } else {
-        return {
-          content: [{ type: "text", text: `No watch found with id '${id}'` }],
-        };
+        return textResult(`No watch found with id '${id}'`);
       }
     },
   });
 
   api.registerTool({
     name: "process_watches",
+    label: "Process Watches",
     description: "List all active process watches",
     parameters: ProcessListParams,
     async execute() {
       if (processes.size === 0) {
-        return {
-          content: [{ type: "text", text: "No active process watches." }],
-        };
+        return textResult("No active process watches.");
       }
 
       const list = Array.from(processes.values())
         .map((p) => {
           const uptime = Math.round((Date.now() - p.startedAt.getTime()) / 1000);
-          return `- **${p.id}**: \`${p.command} ${p.args.join(" ")}\` (PID ${p.process.pid}, up ${uptime}s)`;
+          return `- **${p.id}**: \`${p.command}\` (PID ${p.process.pid}, session: ${p.sessionKey}, up ${uptime}s)`;
         })
         .join("\n");
 
-      return {
-        content: [{ type: "text", text: `Active watches:\n${list}` }],
-      };
+      return textResult(`Active watches:\n${list}`);
     },
   });
 
   // Cleanup on shutdown
-  api.onShutdown?.(() => {
-    for (const [id, watched] of processes) {
-      console.log(`[procwatch] Stopping ${id}`);
+  api.on("gateway_stop", () => {
+    for (const [, watched] of processes) {
+      logger.info(`Shutdown: stopping ${watched.id}`);
+      if (watched.throttleTimer) {
+        clearTimeout(watched.throttleTimer);
+      }
       watched.process.kill("SIGTERM");
     }
     processes.clear();

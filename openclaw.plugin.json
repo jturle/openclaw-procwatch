@@ -1,5 +1,5 @@
 {
-  "id": "procwatch",
+  "id": "openclaw-procwatch",
   "name": "Process Watcher",
   "description": "Watch process output and trigger agent invocations on pattern matches",
   "version": "0.1.0",
@@ -7,14 +7,6 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "webhookUrl": {
-        "type": "string",
-        "description": "Gateway webhook URL (defaults to http://127.0.0.1:18789)"
-      },
-      "webhookToken": {
-        "type": "string",
-        "description": "Webhook auth token (or use OPENCLAW_HOOKS_TOKEN env var)"
-      },
       "defaultPatterns": {
         "type": "array",
         "description": "Default patterns to watch for",
@@ -27,6 +19,10 @@
           },
           "required": ["regex", "label"]
         }
+      },
+      "throttleMs": {
+        "type": "number",
+        "description": "Throttle interval in ms between notifications (default 5000)"
       }
     }
   }
